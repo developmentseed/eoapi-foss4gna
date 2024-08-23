@@ -127,14 +127,15 @@ services:
       - HOST=0.0.0.0
       - PORT=8083
       - WEB_CONCURRENCY=10
-      - POSTGRES_USER=username
-      - POSTGRES_PASS=password
+      - POSTGRES_USER=business
+      - POSTGRES_PASS=casual
       - POSTGRES_DBNAME=postgis
       - POSTGRES_HOST=database
       - POSTGRES_PORT=5432
       - DB_MIN_CONN_SIZE=1
       - DB_MAX_CONN_SIZE=10
       - EOAPI_VECTOR_DEBUG=TRUE
+      - EOAPI_VECTOR_SCHEMAS=["business"]
     env_file:
       - path: .env
         required: false
@@ -146,8 +147,53 @@ services:
         - action: sync+restart
           path: ./runtimes/eoapi/vector/eoapi
           target: /opt/bitnami/python/lib/python3.11/site-packages/eoapi
+        - action: sync+restart
+          path: ./runtimes/business/logic/business
+          target: /opt/bitnami/python/lib/python3.11/site-packages/business
         - action: rebuild
           path: ./runtimes/eoapi/vector/pyproject.toml
+    depends_on:
+      - database
+      - business
+    volumes:
+      - ./dockerfiles/scripts:/tmp/scripts
+
+  business:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.business
+    ports:
+      - "${MY_DOCKER_IP:-127.0.0.1}:8084:8084"
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Application
+      - HOST=0.0.0.0
+      - PORT=8084
+      - WEB_CONCURRENCY=10
+      - POSTGRES_USER=business
+      - POSTGRES_PASS=casual
+      - POSTGRES_DBNAME=postgis
+      - POSTGRES_HOST=database
+      - POSTGRES_PORT=5432
+      - DB_MIN_CONN_SIZE=1
+      - DB_MAX_CONN_SIZE=10
+      - RASTER_ENDPOINT=http://raster:8082
+      - VECTOR_ENDPOINT=http://vector:8083
+      - STAC_ENDPOINT=http://stac:8081
+      - DEBUG=True
+    env_file:
+      - path: .env
+        required: false
+      - path: .business.env
+        required: false
+    command: bash -c "bash /tmp/scripts/wait-for-it.sh -t 120 -h database -p 5432 && /start.sh"
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./runtimes/business/logic/business
+          target: /opt/bitnami/python/lib/python3.11/site-packages/business
+        - action: rebuild
+          path: ./runtimes/business/logic/pyproject.toml
     depends_on:
       - database
     volumes:
@@ -166,7 +212,11 @@ services:
       - "${MY_DOCKER_IP:-127.0.0.1}:5439:5432"
     command: postgres -N 500
     volumes:
-      - ./.pgdata:/var/lib/postgresql/data
+      - eoapi_foss4gna_pgdata:/var/lib/postgresql/data
+      - ./scripts/init-business-user.sql:/docker-entrypoint-initdb.d/zzz-init-business-user.sql
+
+volumes:
+  eoapi_foss4gna_pgdata:
 
 networks:
   default:

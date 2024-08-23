@@ -1,22 +1,30 @@
 
 <p align="center">
   <img width="500" alt="eoapi-devseed" src="https://github.com/developmentseed/eoapi-devseed/assets/10407788/fc69e5ae-4ab7-491f-8c20-6b9e1372b4c6">
-  <p align="center">Example of eoAPI customization.</p>
+  <p align="center">Example of eoAPI customization prepared for FOSS4GNA 2024.</p>
 </p>
 
 ---
 
 **Documentation**: <a href="https://eoapi.dev/customization/" target="_blank">https://eoapi.dev/customization/</a>
 
-**Source Code**: <a href="https://github.com/developmentseed/eoapi-devseed" target="_blank">https://github.com/developmentseed/eoapi-devseed</a>
+**Source Code**: <a href="https://github.com/developmentseed/eoapi-foss4gna" target="_blank">https://github.com/developmentseed/eoapi-foss4gna</a>
 
 ---
 
-This repository shows an example of how users can customize and deploy their own version of eoAPI starting from [eoapi-template](https://github.com/developmentseed/eoapi-template).
+This repository shows an example of how users can build a business application based on eoAPI services, starting from [eoapi-devseed](https://github.com/developmentseed/eoapi-devseed).
 
 ## Custom
 
 ### Runtimes
+
+#### business.logic
+
+A FastAPI application backed by a Postgres database with functions for finding suitable parcels for natural capital projects, like forested areas that have experienced disturbance in recent years (e.g. wildfire, timber harvesting, etc).
+
+- `/parcels`: `POST` GeoJSON features to the `parcel` table in the database
+- `/parcels/{id}/landcover_summary`: Return the area covered by each landcover class in a given year for a parcel
+- `/map`: Load a `leaflet` map with vector tile features from the `parcel` table. Optionally filter down to features that have experienced disturbance in forested areas over a specified time period.
 
 #### eoapi.stac
 
@@ -60,15 +68,30 @@ Before deploying the application on the cloud, you can start by exploring it wit
 docker compose up
 ```
 
-Once the applications are *up*, you'll need to add STAC **Collections** and **Items** to the PgSTAC database. If you don't have, you can use the follow the [MAXAR open data demo](https://github.com/vincentsarago/MAXAR_opendata_to_pgstac) (or get inspired by the other [demos](https://github.com/developmentseed/eoAPI/tree/main/demo)).
+Once the applications are *up*, you'll need to add STAC **Collections** and **Items** to the PgSTAC database.
 
-Then you can start exploring your dataset with:
+To load the Impact Observatory Landcover STAC collection and items to the local database:
 
-  - the STAC Metadata service [http://localhost:8081](http://localhost:8081)
-  - the Raster service [http://localhost:8082](http://localhost:8082)
-  - the browser UI [http://localhost:8085](http://localhost:8085)
+```shell
+# set env vars to point at the database in the docker network
+export BUSINESS_API_ENDPOINT=http://localhost:8084
+export PGUSER=username
+export PGPASSWORD=password
+export PGDATABASE=postgis
+export PGHOST=localhost
+export PGPORT=5439
+```
 
-If you've added a vector dataset to the `public` schema in the Postgres database, they will be available through the **Vector** service at [http://localhost:8083](http://localhost:8083).
+After the STAC metadata are loaded up it is time to add some parcels to the database:
+
+```shell
+# bootstrap the database with some landcover class definitions
+curl -X POST ${BUSINESS_API_ENDPOINT}/bootstrap-data | jq
+
+# load a sample of parcel data from two counties in the US
+scripts/load-parcel-data siskiyou 0-200
+scripts/load-parcel-data st_louis 0-200
+```
 
 ## Deployment
 
@@ -112,4 +135,19 @@ Then, deploy
 
 ```
 npx cdk deploy --all --require-approval never
+```
+
+After deployment, follow the same types of steps to seed the database with STAC metadata and/or parcel records.
+
+## Development
+
+```shell
+source .venv/bin/activate
+
+python -m pip install -e \
+  'runtimes/business/logic' \
+  'runtimes/eoapi/raster' \
+  'runtimes/eoapi/stac' \
+  'runtimes/eoapi/vector'
+
 ```
