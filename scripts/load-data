@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# load a STAC collection + some items into the pgstac database
+scripts/load-stac-records https://api.impactobservatory.com/stac-aws io-10m-annual-lulc --bbox='-148.29763917,3.38110389,-38.91365460,58.72118127'
+
+# download some parcel data and POST it to the API
+scripts/load-parcel-data siskiyou
+scripts/load-parcel-data st_louis

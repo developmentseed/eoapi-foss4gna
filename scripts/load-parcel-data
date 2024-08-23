@@ -1,0 +1,72 @@
+#!/bin/bash
+
+print_usage_exit() {
+  echo "Usage: $0 {st_louis|siskiyou} [start-end]"
+  echo "Example: $0 st_louis 10-20"
+  exit 1
+}
+
+# Check for required arguments
+if [ "$#" -lt 1 -o "$#" -gt 2 ]; then
+  print_usage_exit
+fi
+
+# Assign the file path and content type
+file_path="/tmp/parcels.geojson"
+content_type="application/json"
+
+# Set the URL based on the provided argument
+if [ "$1" = "st_louis" ]; then
+  url="https://gis.stlouiscountymn.gov/server2/rest/services/GeneralUse/OpenData/MapServer/7/query?where=1%3D1&outFields=PRCL_NBR&geometry=-92.79728197,48.11555701,-92.39533099,48.32631071&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outSR=4326&f=geojson"
+  property_to_rename="PRCL_NBR"
+elif [ "$1" = "siskiyou" ]; then
+  url="https://services3.arcgis.com/JmPiYilyU1x5zuxM/arcgis/rest/services/Siskiyou_Parcels_-_Public/FeatureServer/0/query?where=1%3D1&outFields=PARCELID&geometry=-122.15291188,41.15076468,-121.91379738,41.29230470&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outSR=4326&f=geojson"
+  property_to_rename="PARCELID"
+else
+  echo "Invalid argument. Use 'st_louis' or 'siskiyou'."
+  exit 1
+fi
+
+# Download the parcel data
+curl -X GET "$url" > ${file_path}
+
+# validate jq installation.
+if ! [ -x "$(command -v jq)" ]; then
+  echo 'Error: jq is not installed.' >&2
+  exit 1
+fi
+
+# number of features in the GeoJSON file
+feature_count=$(jq '.features | length' "$file_path")
+echo "Total features: $feature_count"
+
+# determine how many features to send
+if [ -n "$2" ]; then
+  if [[ "$2" =~ ^[0-9]+-[0-9]+$ ]]; then
+    start=$(echo "$2" | cut -d '-' -f 1)
+    end=$(echo "$2" | cut -d '-' -f 2)
+
+    if [ "$start" -ge "$feature_count" -o "$end" -ge "$feature_count" -o "$start" -ge "$end" ]; then
+      echo "Invalid range. Check that start and end are within feature count and start is less than end."
+      exit 1
+    fi
+  else
+    print_usage_exit
+  fi
+else
+  start=0
+  end=$(($feature_count - 1))
+fi
+echo "Sending $num_features features..."
+
+# iterate over the features and send each as a separate POST request
+for i in $(seq $start $end); do
+  # Extract the feature while renaming $property_to_rename to 'id'
+  feature=$(jq -c --arg prop "$property_to_rename" '.features['"$i"'] | .properties.id = .properties[$prop] | del(.properties[$prop])' "$file_path")
+
+  # Send the feature in the POST request
+  echo "Sending feature $i / $feature_count"
+  curl -X POST "${BUSINESS_API_ENDPOINT}/parcels" -H "Content-Type: $content_type" --data "$feature"
+done
+
+echo "All features sent."
