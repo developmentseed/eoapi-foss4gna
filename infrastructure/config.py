@@ -12,7 +12,7 @@ from typing_extensions import Self
 
 
 class AppConfig(BaseSettings):
-    project_id: str = Field(description="Project ID", default="eoapi-template-demo")
+    project_id: str = Field(description="Project ID", default="eoapi-foss4gna-demo")
     stage: str = Field(description="Stage of deployment", default="test")
     # because of its validator, `tags` should always come after `project_id` and `stage`
     tags: Optional[Dict[str, str]] = Field(
@@ -21,6 +21,14 @@ class AppConfig(BaseSettings):
         Note that if tags are passed to the CDK CLI via `--tags`,
         they will override any tags defined here.""",
         default=None,
+    )
+    business_dbname: str = Field(
+        description="Business database name",
+        default="business",
+    )
+    business_dbuser: str = Field(
+        description="Business database username",
+        default="user",
     )
     auth_provider_jwks_url: Optional[str] = Field(
         description="""Auth Provider JSON Web Key Set URL for
@@ -40,7 +48,7 @@ class AppConfig(BaseSettings):
         default=None,
     )
     db_instance_type: str = Field(
-        description="Database instance type", default="t3.micro"
+        description="Database instance type", default="t3.small"
     )
     db_allocated_storage: int = Field(
         description="Allocated storage for the database", default=5
@@ -50,7 +58,7 @@ class AppConfig(BaseSettings):
     )
     nat_gateway_count: int = Field(
         description="Number of NAT gateways to create",
-        default=0,
+        default=1,
     )
     bastion_host: bool = Field(
         description="""Whether to create a bastion host. It can typically
@@ -106,6 +114,11 @@ class AppConfig(BaseSettings):
     )
     stac_ingestor_api_custom_domain: Optional[str] = Field(
         description="""Custom domain name for the STAC ingestor API.
+        Must provide `acm_certificate_arn`""",
+        default=None,
+    )
+    business_api_custom_domain: Optional[str] = Field(
+        description="""Custom domain name for the business API.
         Must provide `acm_certificate_arn`""",
         default=None,
     )

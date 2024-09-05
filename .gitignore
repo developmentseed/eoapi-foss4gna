@@ -171,3 +171,4 @@ node_modules/
 .env-cdk
 
 .envrc
+config.yaml
