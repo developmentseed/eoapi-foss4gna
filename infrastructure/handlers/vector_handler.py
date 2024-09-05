@@ -5,6 +5,7 @@ import logging
 import os
 
 from eoapi.vector.app import app
+from eoapi.vector.config import ApiSettings
 from mangum import Mangum
 from tipg.collections import register_collection_catalog
 from tipg.database import connect_to_db
@@ -13,6 +14,7 @@ from tipg.settings import PostgresSettings
 logging.getLogger("mangum.lifespan").setLevel(logging.ERROR)
 logging.getLogger("mangum.http").setLevel(logging.ERROR)
 
+settings = ApiSettings()
 postgres_settings = PostgresSettings()
 
 try:
@@ -28,18 +30,18 @@ sql_files = list(CUSTOM_SQL_DIRECTORY.glob("*.sql"))  # type: ignore
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    """Connect to database on startup."""
+    """Connect to business database on startup."""
     await connect_to_db(
         app,
         settings=postgres_settings,
         # We enable both pgstac and public schemas (pgstac will be used by custom functions)
-        schemas=["pgstac", "public"],
+        schemas=settings.schemas,
         user_sql_files=sql_files,
     )
     await register_collection_catalog(
         app,
         # For the Tables' Catalog we only use the `public` schema
-        schemas=["public"],
+        schemas=settings.schemas,
         # We exclude public functions
         exclude_function_schemas=["public"],
         # We allow non-spatial tables

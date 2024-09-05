@@ -1,20 +1,28 @@
+import json
 import os
+import uuid
 
 import boto3
 import yaml
 from aws_cdk import (
     App,
+    CfnOutput,
+    CustomResource,
+    Duration,
     RemovalPolicy,
     Stack,
     aws_certificatemanager,
     aws_ec2,
     aws_iam,
     aws_lambda,
+    aws_logs,
     aws_rds,
     aws_s3,
+    aws_secretsmanager,
 )
 from aws_cdk.aws_apigateway import DomainNameOptions
-from aws_cdk.aws_apigatewayv2_alpha import DomainName
+from aws_cdk.aws_apigatewayv2_alpha import DomainName, DomainMappingOptions, HttpApi
+from aws_cdk.aws_apigatewayv2_integrations_alpha import HttpLambdaIntegration
 from config import AppConfig
 from constructs import Construct
 from eoapi_cdk import (
@@ -26,6 +34,39 @@ from eoapi_cdk import (
     TiPgApiLambda,
     TitilerPgstacApiLambda,
 )
+
+POSTGRES_PARAMETER_GROUP_SETTINGS = {
+    "t3.micro": {
+        "max_connections": str(200),
+        "shared_buffers": str(int(256 * 1024 / 8)),  # 8 kB
+        "effective_cache_size": str(int(768 * 1024 / 8)),  # 8 kB
+        "maintenance_work_mem": str(64 * 1024),  # kB
+        "checkpoint_completion_target": str(0.9),
+        "wal_buffers": str(int(7864 / 8)),  # 8 kB
+        "default_statistics_target": str(100),
+        "random_page_cost": str(1.1),
+        "effective_io_concurrency": str(200),  # number
+        "work_mem": str(655),  # kB
+        "huge_pages": "off",
+        "min_wal_size": str(1 * 1024),  # MB
+        "max_wal_size": str(4 * 1024),  # MB
+    },
+    "t3.small": {
+        "max_connections": str(200),
+        "shared_buffers": str(int(512 * 1024 / 8)),  # 8 kB
+        "effective_cache_size": str(int(1536 * 1024 / 8)),  # 8 kB
+        "maintenance_work_mem": str(128 * 1024),  # kB
+        "checkpoint_completion_target": str(0.9),
+        "wal_buffers": str(int(16 * 1024 / 8)),  # 8 kB
+        "default_statistics_target": str(100),
+        "random_page_cost": str(1.1),
+        "effective_io_concurrency": str(200),  # number
+        "work_mem": str(1310),  # kB
+        "huge_pages": "off",
+        "min_wal_size": str(1 * 1024),  # MB
+        "max_wal_size": str(4 * 1024),  # MB
+    },
+}
 
 
 class VpcStack(Stack):
@@ -81,6 +122,95 @@ class VpcStack(Stack):
         )
 
 
+class BootstrappedDb(Construct):
+    """
+    Given an RDS database, connect to DB and create a database, user, and
+    password
+    """
+
+    def __init__(
+        self,
+        scope: Construct,
+        id: str,
+        db: aws_rds.DatabaseInstance,
+        new_dbname: str,
+        new_username: str,
+        secrets_prefix: str,
+        context_dir: str = "../../",
+    ) -> None:
+        """Update RDS database."""
+        super().__init__(scope, id)
+
+        deployment_version = str(uuid.uuid4())
+        # TODO: Utilize a singleton function.
+        handler = aws_lambda.Function(
+            self,
+            "database-bootstrapper",
+            handler="handler.handler",
+            runtime=aws_lambda.Runtime.PYTHON_3_11,
+            code=aws_lambda.Code.from_docker_build(
+                path=os.path.abspath(context_dir),
+                file="infrastructure/dockerfiles/Dockerfile.bootstrap",
+                build_args={"PYTHON_VERSION": "3.11"},
+                platform="linux/amd64",
+            ),
+            timeout=Duration.minutes(2),
+            vpc=db.vpc,
+            allow_public_subnet=True,
+            log_retention=aws_logs.RetentionDays.ONE_WEEK,
+        )
+
+        self.secret = aws_secretsmanager.Secret(
+            self,
+            id,
+            secret_name=os.path.join(
+                secrets_prefix, id.replace(" ", "_"), self.node.addr
+            ),
+            generate_secret_string=aws_secretsmanager.SecretStringGenerator(
+                secret_string_template=json.dumps(
+                    {
+                        "dbname": new_dbname,
+                        "engine": "postgres",
+                        "port": 5432,
+                        "host": db.instance_endpoint.hostname,
+                        "username": new_username,
+                    },
+                ),
+                generate_string_key="password",
+                exclude_punctuation=True,
+            ),
+            description=f"Deployed by {Stack.of(self).stack_name}",
+        )
+
+        self.resource = CustomResource(
+            scope=scope,
+            id="bootstrapped-db-resource",
+            service_token=handler.function_arn,
+            properties={
+                # By setting pgstac_version in the properties assures
+                # that Create/Update events will be passed to the service token
+                "conn_secret_arn": db.secret.secret_arn,
+                "new_user_secret_arn": self.secret.secret_arn,
+                "deployment_version": deployment_version,  # Ensures unique deployments
+            },
+            # We do not need to run the custom resource on STAC Delete
+            # Custom Resource are not physical resources so it's OK to `Retain` it
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+
+        # Allow lambda to...
+        # read new user secret
+        self.secret.grant_read(handler)
+        # read database secret
+        db.secret.grant_read(handler)
+        # connect to database
+        db.connections.allow_from(handler, port_range=aws_ec2.Port.tcp(5432))
+
+    def is_required_by(self, construct: Construct):
+        """Register required services."""
+        return construct.node.add_dependency(self.resource)
+
+
 class eoAPIStack(Stack):
     def __init__(
         self,
@@ -100,13 +230,27 @@ class eoAPIStack(Stack):
 
         #######################################################################
         # PG database
+        postgres_engine = aws_rds.DatabaseInstanceEngine.postgres(
+            version=aws_rds.PostgresEngineVersion.VER_14
+        )
+
+        if parameter_group_values := POSTGRES_PARAMETER_GROUP_SETTINGS.get(
+            app_config.db_instance_type
+        ):
+            parameter_group = aws_rds.ParameterGroup(
+                self,
+                "db-parameter-group",
+                engine=postgres_engine,
+                parameters=parameter_group_values,
+            )
+        else:
+            parameter_group = None
+
         pgstac_db = PgStacDatabase(
             self,
             "pgstac-db",
             vpc=vpc,
-            engine=aws_rds.DatabaseInstanceEngine.postgres(
-                version=aws_rds.PostgresEngineVersion.VER_14
-            ),
+            engine=postgres_engine,
             vpc_subnets=aws_ec2.SubnetSelection(
                 subnet_type=(
                     aws_ec2.SubnetType.PUBLIC
@@ -114,6 +258,7 @@ class eoAPIStack(Stack):
                     else aws_ec2.SubnetType.PRIVATE_ISOLATED
                 )
             ),
+            parameter_group=parameter_group,
             allocated_storage=app_config.db_allocated_storage,
             instance_type=aws_ec2.InstanceType(app_config.db_instance_type),
             removal_policy=RemovalPolicy.DESTROY,
@@ -254,68 +399,6 @@ class eoAPIStack(Stack):
             },
         )
 
-        #######################################################################
-        # Vector Service
-        TiPgApiLambda(
-            self,
-            "vector-api",
-            db=pgstac_db.db,
-            db_secret=pgstac_db.pgstac_secret,
-            api_env={
-                "EOAPI_VECTOR_NAME": app_config.build_service_name("vector"),
-                "description": f"{app_config.stage} tipg API",
-                "POSTGRES_HOST": pgstac_db.pgstac_secret.secret_value_from_json(
-                    "host"
-                ).to_string(),
-                "POSTGRES_DBNAME": pgstac_db.pgstac_secret.secret_value_from_json(
-                    "dbname"
-                ).to_string(),
-                "POSTGRES_USER": pgstac_db.pgstac_secret.secret_value_from_json(
-                    "username"
-                ).to_string(),
-                "POSTGRES_PASS": pgstac_db.pgstac_secret.secret_value_from_json(
-                    "password"
-                ).to_string(),
-                "POSTGRES_PORT": pgstac_db.pgstac_secret.secret_value_from_json(
-                    "port"
-                ).to_string(),
-            },
-            # If the db is not in the public subnet then we need to put
-            # the lambda within the VPC
-            vpc=vpc if not app_config.public_db_subnet else None,
-            subnet_selection=aws_ec2.SubnetSelection(
-                subnet_type=aws_ec2.SubnetType.PRIVATE_WITH_EGRESS
-            )
-            if not app_config.public_db_subnet
-            else None,
-            tipg_api_domain_name=(
-                DomainName(
-                    self,
-                    "vector-api-domain-name",
-                    domain_name=app_config.vector_api_custom_domain,
-                    certificate=aws_certificatemanager.Certificate.from_certificate_arn(
-                        self,
-                        "vector-api-cdn-certificate",
-                        certificate_arn=app_config.acm_certificate_arn,
-                    ),
-                )
-                if app_config.vector_api_custom_domain
-                else None
-            ),
-            lambda_function_options={
-                "code": aws_lambda.Code.from_docker_build(
-                    path=os.path.abspath(context_dir),
-                    file="infrastructure/dockerfiles/Dockerfile.vector",
-                    build_args={
-                        "PYTHON_VERSION": "3.11",
-                    },
-                    platform="linux/amd64",
-                ),
-                "handler": "handler.handler",
-                "runtime": aws_lambda.Runtime.PYTHON_3_11,
-            },
-        )
-
         if app_config.stac_ingestor:
             #######################################################################
             # STAC Ingestor Service
@@ -417,6 +500,159 @@ class eoAPIStack(Stack):
                 website_index_document="index.html",
                 bucket_arn=stac_browser_bucket.bucket_arn,
             )
+
+        #######################################################################
+        # Business API
+
+        setup_db = BootstrappedDb(
+            self,
+            "bootstrappedbusinessdb",
+            db=pgstac_db.db,
+            new_dbname=app_config.business_dbname,
+            new_username=app_config.business_dbuser,
+            secrets_prefix=os.path.join(app_config.stage, app_config.project_id),
+            context_dir=context_dir,
+        )
+
+        #######################################################################
+        # Vector Service
+        vector = TiPgApiLambda(
+            self,
+            "vector-api",
+            db=pgstac_db.db,
+            db_secret=pgstac_db.pgstac_secret,
+            api_env={
+                "EOAPI_VECTOR_NAME": app_config.build_service_name("vector"),
+                "description": f"{app_config.stage} tipg API",
+                "POSTGRES_USER": setup_db.secret.secret_value_from_json(
+                    "username"
+                ).to_string(),
+                "POSTGRES_PASS": setup_db.secret.secret_value_from_json(
+                    "password"
+                ).to_string(),
+                "POSTGRES_DBNAME": setup_db.secret.secret_value_from_json(
+                    "dbname"
+                ).to_string(),
+                "POSTGRES_HOST": setup_db.secret.secret_value_from_json(
+                    "host"
+                ).to_string(),
+                "POSTGRES_PORT": setup_db.secret.secret_value_from_json(
+                    "port"
+                ).to_string(),
+                "EOAPI_VECTOR_SCHEMAS": '["business"]',
+            },
+            # If the db is not in the public subnet then we need to put
+            # the lambda within the VPC
+            vpc=vpc if not app_config.public_db_subnet else None,
+            subnet_selection=aws_ec2.SubnetSelection(
+                subnet_type=aws_ec2.SubnetType.PRIVATE_WITH_EGRESS
+            )
+            if not app_config.public_db_subnet
+            else None,
+            tipg_api_domain_name=(
+                DomainName(
+                    self,
+                    "vector-api-domain-name",
+                    domain_name=app_config.vector_api_custom_domain,
+                    certificate=aws_certificatemanager.Certificate.from_certificate_arn(
+                        self,
+                        "vector-api-cdn-certificate",
+                        certificate_arn=app_config.acm_certificate_arn,
+                    ),
+                )
+                if app_config.vector_api_custom_domain
+                else None
+            ),
+            lambda_function_options={
+                "code": aws_lambda.Code.from_docker_build(
+                    path=os.path.abspath(context_dir),
+                    file="infrastructure/dockerfiles/Dockerfile.vector",
+                    build_args={
+                        "PYTHON_VERSION": "3.11",
+                    },
+                    platform="linux/amd64",
+                ),
+                "handler": "handler.handler",
+                "runtime": aws_lambda.Runtime.PYTHON_3_11,
+            },
+        )
+        setup_db.is_required_by(vector)
+
+        #######################################################################
+        # Business API
+        business_lambda = aws_lambda.Function(
+            scope=self,
+            id="business-lambda",
+            runtime=aws_lambda.Runtime.PYTHON_3_11,
+            handler="handler.handler",
+            memory_size=3000,
+            log_retention=aws_logs.RetentionDays.ONE_WEEK,
+            timeout=Duration.seconds(30),
+            code=aws_lambda.Code.from_docker_build(
+                path=os.path.abspath(context_dir),
+                file="infrastructure/dockerfiles/Dockerfile.business",
+                build_args={"PYTHON_VERSION": "3.11"},
+            ),
+            vpc=vpc,
+            vpc_subnets=aws_ec2.SubnetSelection(
+                subnet_type=aws_ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            environment={
+                "MODE": "production",
+                "POSTGRES_USER": setup_db.secret.secret_value_from_json(
+                    "username"
+                ).to_string(),
+                "POSTGRES_PASS": setup_db.secret.secret_value_from_json(
+                    "password"
+                ).to_string(),
+                "POSTGRES_DBNAME": setup_db.secret.secret_value_from_json(
+                    "dbname"
+                ).to_string(),
+                "POSTGRES_HOST": setup_db.secret.secret_value_from_json(
+                    "host"
+                ).to_string(),
+                "POSTGRES_PORT": setup_db.secret.secret_value_from_json(
+                    "port"
+                ).to_string(),
+                "RASTER_ENDPOINT": raster.url,
+                "VECTOR_ENDPOINT": vector.url,
+                "STAC_ENDPOINT": stac.url,
+            },
+        )
+        setup_db.is_required_by(business_lambda)
+
+        business_lambda.connections.allow_to(
+            pgstac_db.db,
+            aws_ec2.Port.tcp(5432),
+            "allow connections from business application",
+        )
+
+        if app_config.business_api_custom_domain and app_config.acm_certificate_arn:
+            api_certificate = aws_certificatemanager.Certificate.from_certificate_arn(
+                self, "APICertificate", app_config.acm_certificate_arn
+            )
+            default_domain_mapping = DomainMappingOptions(
+                domain_name=DomainName(
+                    self,
+                    "BusinessApiDomainName",
+                    domain_name=app_config.business_api_custom_domain,
+                    certificate=api_certificate,
+                )
+            )
+        else:
+            default_domain_mapping = None
+
+        business_api = HttpApi(
+            scope=self,
+            id="business-api",
+            default_integration=HttpLambdaIntegration(
+                "business-api-integration",
+                handler=business_lambda,  # type: ignore
+            ),
+            default_domain_mapping=default_domain_mapping,
+        )
+
+        CfnOutput(self, "business-api-url", value=business_api.url)
 
     def _create_data_access_role(self) -> aws_iam.Role:
         """
